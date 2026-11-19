@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import all_articles_blob
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
@@ -32,13 +30,15 @@ def parse_resolution(text: str) -> TicketResolution:
     )
 
 
-_FEW_SHOT = """
-Example ticket resolutions (format to copy):
-
-1. Unopened headphones, day 10 → {"action":"REFUND","kb_article":"returns-within-30-days"}
-2. Ebook, license shown → {"action":"SEND_ARTICLE","kb_article":"digital-license-no-refund"}
-3. Cracked custom mug → {"action":"ESCALATE_TIER2","kb_article":"custom-items-no-replace"}
-4. Cracked stock mug, day 2 → {"action":"REPLACE","kb_article":"damage-replacement-7-days"}
+# Keep the policy knowledge small and stable.  The model only needs the routing
+# rules and article ids to make a decision; sending the full article prose and
+# worked examples on every ticket adds cost without adding decision signal.
+_POLICY_GUIDE = """POLICIES:
+returns-within-30-days: physical, unopened, delivered <=30 days -> REFUND.
+digital-license-no-refund: revealed digital license -> SEND_ARTICLE.
+custom-items-no-replace: damaged customized item -> ESCALATE_TIER2.
+damage-replacement-7-days: damaged non-custom item, delivered <=7 days -> REPLACE.
+subscription-cooling-off: subscription <=30 days -> REFUND; otherwise SEND_ARTICLE.
 """
 
 
@@ -58,18 +58,15 @@ class SupportCopilot:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
         thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
+        snapshot = json.dumps(order, separators=(",", ":"))
 
-        system = "\n\n".join(
+        system = "\n".join(
             [
-                f"Run id {uuid.uuid4()}",
-                "You are ShopAssist, the Tier-1 customer support copilot.",
-                _FEW_SHOT,
-                "HELP CENTER:",
-                all_articles_blob(),
+                "You are ShopAssist, a Tier-1 customer support copilot.",
+                _POLICY_GUIDE.rstrip(),
                 (
-                    "Instructions: Think step by step. Write full reasoning, quote any article "
-                    "you rely on, then output JSON with action, kb_article, customer_reply."
+                    "Use the order facts and applicable policy. Return only a JSON object with "
+                    "action, kb_article, and customer_reply. Do not include an explanation."
                 ),
             ]
         )

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import expanded_help_center_blob, title_index
+from shared.kb import load_article
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
@@ -18,72 +17,86 @@ class TicketResolution:
     kb_article: str
 
 
+@dataclass(frozen=True)
+class TriageResult:
+    """Small, serializable handoff between the pipeline's first two nodes."""
+
+    facts: dict[str, object]
+    candidate_articles: tuple[str, ...]
+
+
+_ALLOWED_ACTIONS = {"REFUND", "REPLACE", "SEND_ARTICLE", "ESCALATE_TIER2"}
+
+
 class SupportPipeline:
     """Same product as Question 1 — triage, retrieve, compose, audit."""
 
     def __init__(self, session: CostSession | None = None):
         self.session = session or CostSession()
         self.llm = LlmClient(self.session)
-        self.help_center = expanded_help_center_blob()
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
         thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
+        snapshot = json.dumps(order, separators=(",", ":"))
 
-        triage = self._triage(ticket_id, thread, snapshot)
-        retrieved = self._retrieve(triage, snapshot)
+        triage = self._triage(order)
+        retrieved = self._retrieve(triage)
         draft = self._compose(ticket_id, thread, snapshot, triage, retrieved)
-        final = self._audit(ticket_id, thread, snapshot, triage, retrieved, draft)
-        parsed = parse_resolution(final)
-        return TicketResolution(parsed.action, parsed.kb_article)
+        return self._audit(draft, triage, retrieved)
 
-    def _triage(self, ticket_id: str, thread: str, snapshot: str) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "\n".join(
-                    [
-                        f"trace-{uuid.uuid4()}",
-                        "Triage node: restate the ticket step by step and list candidate kb articles.",
-                        f"ARTICLE TITLES:\n{title_index(500)}",
-                        self.help_center[:120_000],
-                    ]
-                ),
-            ),
-            ChatMessage(
-                "user",
-                f"TICKET {ticket_id}\nTHREAD:\n{thread}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ),
-        ]
-        return self.llm.chat("triage", messages)
+    def _triage(self, order: dict) -> TriageResult:
+        """Select policy candidates locally from structured order facts.
 
-    def _retrieve(self, triage: str, snapshot: str) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Retrieve node: print full text of the eight most relevant help articles.",
-            ),
-            ChatMessage(
-                "user",
-                f"TRIAGE:\n{triage}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ),
-        ]
-        return self.llm.chat("retrieve", messages)
+        This is retrieval routing, not a customer-facing decision: the model still
+        produces the final action and citation after receiving the source policy.
+        """
+        facts = {
+            key: order.get(key)
+            for key in (
+                "product_type",
+                "delivered_days_ago",
+                "subscription_age_days",
+                "opened",
+                "license_revealed",
+                "customized",
+                "damage_reported",
+            )
+            if key in order
+        }
+
+        if order.get("product_type") == "subscription":
+            candidates = ("subscription-cooling-off",)
+        elif order.get("license_revealed"):
+            candidates = ("digital-license-no-refund",)
+        elif order.get("customized") and order.get("damage_reported"):
+            candidates = ("custom-items-no-replace",)
+        elif order.get("damage_reported"):
+            candidates = ("damage-replacement-7-days", "returns-within-30-days")
+        else:
+            candidates = ("returns-within-30-days",)
+        return TriageResult(facts=facts, candidate_articles=candidates)
+
+    def _retrieve(self, triage: TriageResult) -> dict[str, str]:
+        """Load only the policy documents selected by triage."""
+        return {article_id: load_article(article_id) for article_id in triage.candidate_articles}
 
     def _compose(
         self,
         ticket_id: str,
         thread: str,
         snapshot: str,
-        triage: str,
-        retrieved: str,
+        triage: TriageResult,
+        retrieved: dict[str, str],
     ) -> str:
         messages = [
             ChatMessage(
                 "system",
-                "Compose node: full reasoning, then JSON with action, kb_article, customer_reply.",
+                (
+                    "Compose node: decide using only the supplied policy and order facts. "
+                    "Return only JSON with action, kb_article, and customer_reply."
+                ),
             ),
             ChatMessage(
                 "user",
@@ -92,9 +105,8 @@ class SupportPipeline:
                         f"TICKET {ticket_id}",
                         f"THREAD:\n{thread}",
                         f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                        f"TRIAGE AGAIN:\n{triage}",
+                        f"TRIAGE_FACTS:\n{json.dumps(triage.facts, separators=(',', ':'))}",
+                        f"POLICY_ARTICLES:\n{json.dumps(retrieved, separators=(',', ':'))}",
                     ]
                 ),
             ),
@@ -103,31 +115,17 @@ class SupportPipeline:
 
     def _audit(
         self,
-        ticket_id: str,
-        thread: str,
-        snapshot: str,
-        triage: str,
-        retrieved: str,
         draft: str,
-    ) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Audit node: double-check policy, restate ticket, rewrite JSON output.",
-            ),
-            ChatMessage(
-                "user",
-                "\n\n".join(
-                    [
-                        self.help_center[:80_000],
-                        f"TICKET {ticket_id}",
-                        f"THREAD:\n{thread}",
-                        f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"DRAFT:\n{draft}",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                    ]
-                ),
-            ),
-        ]
-        return self.llm.chat("audit", messages)
+        triage: TriageResult,
+        retrieved: dict[str, str],
+    ) -> TicketResolution:
+        """Validate the generated answer without another costly model completion."""
+        parsed = parse_resolution(draft)
+        if parsed.action not in _ALLOWED_ACTIONS:
+            raise ValueError(f"Unsupported action from compose node: {parsed.action}")
+        if parsed.kb_article not in retrieved:
+            raise ValueError(
+                "Compose node cited an article that was not retrieved: "
+                f"{parsed.kb_article}; candidates={triage.candidate_articles}"
+            )
+        return TicketResolution(parsed.action, parsed.kb_article)

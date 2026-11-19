@@ -21,7 +21,11 @@ def test_pipeline_resolves_public_tickets():
         assert got.kb_article == expected.kb_article
 
 
-def test_baseline_cost_is_high():
+def test_pipeline_cost_stays_within_budget():
     pipe = SupportPipeline()
-    pipe.handle_ticket(PUBLIC[0])
-    assert pipe.session.total_points() > 70_000
+    for tid in PUBLIC:
+        pipe.handle_ticket(tid)
+    # Triage, retrieval, and audit are local deterministic stages; compose is
+    # the only stage that needs a model completion.
+    assert len(pipe.session.calls) == len(PUBLIC)
+    assert all(call.label == "compose" and call.points() <= 2_500 for call in pipe.session.calls)
